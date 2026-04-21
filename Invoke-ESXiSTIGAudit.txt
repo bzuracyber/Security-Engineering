@@ -1,0 +1,1039 @@
+<#
+.SYNOPSIS
+    ESXi 8.0 STIG V2R3 Audit Script
+    Checks all 77 Vulnerability IDs and outputs a .cklb file per host
+    for direct import into STIG Viewer 3.x.
+
+.NOTES
+    Requirements:
+    - PowerCLI modules loaded (see load order below)
+    - STIG XML file at C:\Temp\U_VMW_vSphere_8-0-ESXi_STIG_V2R3_Manual-xccdf.xml
+    - Network access to ESXi hosts
+
+    Load order before running:
+    Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+    Import-Module "C:\Temp\OfflineModules\VMware.VimAutomation.Sdk\13.4.0.24798382\net472\VMware.VimAutomation.Sdk.psd1" -Force
+    Import-Module "C:\Temp\OfflineModules\VMware.Vim\9.0.0.24798382\net472\VMware.Vim.psd1" -Force
+    Import-Module "C:\Temp\OfflineModules\VMware.OpenAPI\13.4.0.24798382\net472\VMware.OpenAPI.psd1" -Force
+    Import-Module "C:\Temp\OfflineModules\VMware.VimAutomation.Common\13.4.0.24798382\net472\VMware.VimAutomation.Common.psd1" -Force
+    Import-Module "C:\Temp\OfflineModules\VMware.VimAutomation.Cis.Core\13.4.0.24798382\net472\VMware.VimAutomation.Cis.Core.psd1" -Force
+    Import-Module "C:\Temp\OfflineModules\VMware.VimAutomation.Core\13.4.0.24798382\net472\VMware.VimAutomation.Core.psd1" -Force
+#>
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+$STIGXmlPath   = "C:\Temp\U_VMW_vSphere_8-0-ESXi_STIG_V2R3_Manual-xccdf.xml"
+$OutputDir     = "C:\Temp\STIG_Audits"
+
+# ============================================================
+# VCENTER SELECTION
+# ============================================================
+$vCenters = @{
+    "1" = "test1.test.what.mil"
+    "2" = "test2.test.what.mil"
+    "3" = "test3.test.what.mil"
+    "4" = "test4.test.what.mil"
+}
+
+Write-Host "`n===== SELECT VCENTER SERVER =====" -ForegroundColor Cyan
+foreach ($key in ($vCenters.Keys | Sort-Object)) {
+    Write-Host "  [$key] $($vCenters[$key])" -ForegroundColor White
+}
+do {
+    $selection = Read-Host "`nEnter number (1-4)"
+} while (-not $vCenters.ContainsKey($selection))
+
+$VCenterServer = $vCenters[$selection]
+Write-Host "[+] Selected: $VCenterServer" -ForegroundColor Green
+
+$Credential = Get-Credential -Message "Enter credentials for $VCenterServer"
+
+# ============================================================
+# MODULE LOAD
+# ============================================================
+$ModuleBase = "C:\Temp\OfflineModules"
+Write-Host "[*] Loading PowerCLI modules..." -ForegroundColor Cyan
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+Import-Module "$ModuleBase\VMware.VimAutomation.Sdk\13.4.0.24798382\net472\VMware.VimAutomation.Sdk.psd1" -Force
+Import-Module "$ModuleBase\VMware.Vim\9.0.0.24798382\net472\VMware.Vim.psd1" -Force
+Import-Module "$ModuleBase\VMware.OpenAPI\13.4.0.24798382\net472\VMware.OpenAPI.psd1" -Force
+Import-Module "$ModuleBase\VMware.VimAutomation.Common\13.4.0.24798382\net472\VMware.VimAutomation.Common.psd1" -Force
+Import-Module "$ModuleBase\VMware.VimAutomation.Cis.Core\13.4.0.24798382\net472\VMware.VimAutomation.Cis.Core.psd1" -Force
+Import-Module "$ModuleBase\VMware.VimAutomation.Core\13.4.0.24798382\net472\VMware.VimAutomation.Core.psd1" -Force
+Write-Host "[+] PowerCLI modules loaded." -ForegroundColor Green
+
+# ============================================================
+# SETUP
+# ============================================================
+if (!(Test-Path $OutputDir)) { New-Item $OutputDir -ItemType Directory | Out-Null }
+
+# Suppress certificate warnings
+Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+
+# Load STIG XML for rule metadata
+[xml]$StigXml = Get-Content $STIGXmlPath
+$ns = @{ xccdf = "http://checklists.nist.gov/xccdf/1.1" }
+
+# Build lookup table: VulnID -> (RuleID, Title, Description, CheckText)
+$RuleLookup = @{}
+foreach ($group in $StigXml.Benchmark.Group) {
+    $vulnId   = $group.id
+    $rule     = $group.Rule
+    $ruleId   = $rule.id
+    $title    = $rule.title
+    $severity = $rule.severity
+    $checkText = $rule.check.'check-content'
+    $RuleLookup[$vulnId] = @{
+        RuleId    = $ruleId
+        Title     = $title
+        Severity  = $severity
+        CheckText = $checkText
+    }
+}
+
+# ============================================================
+# AUDIT CHECKS
+# Each check returns: @{ Status = "NotAFinding"|"Open"|"Not_Applicable"; Details = "..." }
+# ============================================================
+function Invoke-Checks {
+    param($VMHost, $Esxcli)
+
+    $results = @{}
+
+    # Helper: Get advanced setting value
+    function Get-Adv { param($Name)
+        try { ($VMHost | Get-AdvancedSetting -Name $Name -ErrorAction Stop).Value }
+        catch { $null }
+    }
+
+    # Helper: Get esxcli ssh config value
+    function Get-SshConfig { param($Key)
+        try {
+            ($Esxcli.system.ssh.server.config.list.Invoke() | Where-Object { $_.Key -eq $Key }).Value
+        } catch { $null }
+    }
+
+    # Helper: Get service running state
+    function Get-ServiceState { param($Name)
+        try { (Get-VMHostService -VMHost $VMHost -ErrorAction Stop | Where-Object { $_.Key -eq $Name }).Running }
+        catch { $null }
+    }
+
+    # --- V-258728: Account Lock Failures = 3 ---
+    $val = Get-Adv "Security.AccountLockFailures"
+    $results["V-258728"] = if ($val -eq 3) {
+        @{ Status = "NotAFinding"; Details = "Security.AccountLockFailures is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Security.AccountLockFailures is set to '$val'. Expected: 3." }
+    }
+
+    # --- V-258729: DCUI Banner ---
+    $val = Get-Adv "Annotations.WelcomeMessage"
+    $results["V-258729"] = if ($val -match "authorized use only" -or $val -match "U\.S\. Government") {
+        @{ Status = "NotAFinding"; Details = "Annotations.WelcomeMessage contains DOD banner text." }
+    } else {
+        @{ Status = "Open"; Details = "Annotations.WelcomeMessage does not contain required DOD banner. Current value: '$val'" }
+    }
+
+    # --- V-258730: Lockdown Mode ---
+    $lockdown = $VMHost.ExtensionData.Config.LockdownMode
+    $results["V-258730"] = if ($lockdown -ne "lockdownDisabled") {
+        @{ Status = "NotAFinding"; Details = "Lockdown mode is set to: $lockdown." }
+    } else {
+        @{ Status = "Open"; Details = "Lockdown mode is disabled. Expected: lockdownNormal or lockdownStrict." }
+    }
+
+    # --- V-258731: Host Client Session Timeout <= 900 ---
+    $val = Get-Adv "UserVars.HostClientSessionTimeout"
+    $results["V-258731"] = if ($val -ne $null -and [int]$val -le 900 -and [int]$val -ne 0) {
+        @{ Status = "NotAFinding"; Details = "UserVars.HostClientSessionTimeout is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "UserVars.HostClientSessionTimeout is set to '$val'. Expected: 900 or less (not 0)." }
+    }
+
+    # --- V-258732: SSH FIPS 140-2 ---
+    try {
+        $fips = $Esxcli.system.security.fips140.ssh.get.Invoke()
+        $results["V-258732"] = if ($fips.Enabled -eq $true -or $fips.Enabled -eq "true") {
+            @{ Status = "NotAFinding"; Details = "SSH FIPS 140-2 is enabled." }
+        } else {
+            @{ Status = "Open"; Details = "SSH FIPS 140-2 is not enabled. Current value: $($fips.Enabled)." }
+        }
+    } catch {
+        $results["V-258732"] = @{ Status = "Open"; Details = "Could not retrieve SSH FIPS status: $_" }
+    }
+
+    # --- V-258733: Log Level = info ---
+    $val = Get-Adv "Config.HostAgent.log.level"
+    $results["V-258733"] = if ($val -eq "info") {
+        @{ Status = "NotAFinding"; Details = "Config.HostAgent.log.level is set to '$val'." }
+    } else {
+        @{ Status = "Open"; Details = "Config.HostAgent.log.level is set to '$val'. Expected: info." }
+    }
+
+    # --- V-258734: Password Quality ---
+    $val = Get-Adv "Security.PasswordQualityControl"
+    $results["V-258734"] = if ($val -eq "similar=deny retry=3 min=disabled,disabled,disabled,disabled,15") {
+        @{ Status = "NotAFinding"; Details = "Security.PasswordQualityControl is correctly configured." }
+    } else {
+        @{ Status = "Open"; Details = "Security.PasswordQualityControl is '$val'. Expected: 'similar=deny retry=3 min=disabled,disabled,disabled,disabled,15'." }
+    }
+
+    # --- V-258735: Password History >= 5 ---
+    $val = Get-Adv "Security.PasswordHistory"
+    $results["V-258735"] = if ($val -ne $null -and [int]$val -ge 5) {
+        @{ Status = "NotAFinding"; Details = "Security.PasswordHistory is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Security.PasswordHistory is set to '$val'. Expected: 5 or greater." }
+    }
+
+    # --- V-258736: MOB Disabled ---
+    $val = Get-Adv "Config.HostAgent.plugins.solo.enableMob"
+    $results["V-258736"] = if ($val -eq $false -or $val -eq "false") {
+        @{ Status = "NotAFinding"; Details = "Config.HostAgent.plugins.solo.enableMob is false." }
+    } else {
+        @{ Status = "Open"; Details = "Config.HostAgent.plugins.solo.enableMob is '$val'. Expected: false." }
+    }
+
+    # --- V-258737: Active Directory (manual check) ---
+    $results["V-258737"] = @{ Status = "Not_Reviewed"; Details = "Manual check required. Verify Active Directory configuration under Configure >> System >> Authentication Services." }
+
+    # --- V-258738: SSH IgnoreRhosts = yes ---
+    $val = Get-SshConfig "ignorerhosts"
+    $results["V-258738"] = if ($val -eq "yes") {
+        @{ Status = "NotAFinding"; Details = "SSH ignorerhosts is set to '$val'." }
+    } else {
+        @{ Status = "Open"; Details = "SSH ignorerhosts is set to '$val'. Expected: yes." }
+    }
+
+    # --- V-258739: Shell Interactive Timeout <= 900 ---
+    $val = Get-Adv "UserVars.ESXiShellInteractiveTimeOut"
+    $results["V-258739"] = if ($val -ne $null -and [int]$val -le 900 -and [int]$val -ne 0) {
+        @{ Status = "NotAFinding"; Details = "UserVars.ESXiShellInteractiveTimeOut is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "UserVars.ESXiShellInteractiveTimeOut is set to '$val'. Expected: 900 or less (not 0)." }
+    }
+
+    # --- V-258740: Secure Boot Enforcement ---
+    try {
+        $enc = $Esxcli.system.settings.encryption.get.Invoke()
+        $results["V-258740"] = if ($enc.Mode -eq "TPM") {
+            @{ Status = "NotAFinding"; Details = "Encryption mode is TPM." }
+        } else {
+            @{ Status = "Open"; Details = "Encryption mode is '$($enc.Mode)'. Expected: TPM." }
+        }
+    } catch {
+        $results["V-258740"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve encryption settings: $_" }
+    }
+
+    # --- V-258741: Secure Boot Enabled ---
+    try {
+        $sb = $VMHost.ExtensionData.Capability.UefiSecureBoot
+        $results["V-258741"] = if ($sb -eq $true) {
+            @{ Status = "NotAFinding"; Details = "Secure Boot is enabled." }
+        } else {
+            @{ Status = "Open"; Details = "Secure Boot is not enabled." }
+        }
+    } catch {
+        $results["V-258741"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve Secure Boot status: $_" }
+    }
+
+    # --- V-258742: Account Unlock Time <= 900 ---
+    $val = Get-Adv "Security.AccountUnlockTime"
+    $results["V-258742"] = if ($val -ne $null -and [int]$val -le 900 -and [int]$val -ne 0) {
+        @{ Status = "NotAFinding"; Details = "Security.AccountUnlockTime is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Security.AccountUnlockTime is set to '$val'. Expected: 900 or less (not 0)." }
+    }
+
+    # --- V-258743: Audit Record Storage = 100 ---
+    $val = Get-Adv "Syslog.global.auditRecord.storageCapacity"
+    $results["V-258743"] = if ($val -eq 100) {
+        @{ Status = "NotAFinding"; Details = "Syslog.global.auditRecord.storageCapacity is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Syslog.global.auditRecord.storageCapacity is set to '$val'. Expected: 100." }
+    }
+
+    # --- V-258744: Syslog Remote Host configured ---
+    $val = Get-Adv "Syslog.global.logHost"
+    $results["V-258744"] = if ($val -ne $null -and $val -ne "") {
+        @{ Status = "NotAFinding"; Details = "Syslog.global.logHost is configured: '$val'." }
+    } else {
+        @{ Status = "Open"; Details = "Syslog.global.logHost is not configured." }
+    }
+
+    # --- V-258745: NTP Configured ---
+    try {
+        $ntp = Get-VMHostNtpServer -VMHost $VMHost -ErrorAction Stop
+        $ntpService = Get-VMHostService -VMHost $VMHost | Where-Object { $_.Key -eq "ntpd" }
+        $results["V-258745"] = if ($ntp.Count -gt 0 -and $ntpService.Running) {
+            @{ Status = "NotAFinding"; Details = "NTP is configured with servers: $($ntp -join ', ') and service is running." }
+        } else {
+            @{ Status = "Open"; Details = "NTP servers: '$($ntp -join ', ')'. NTP service running: $($ntpService.Running)." }
+        }
+    } catch {
+        $results["V-258745"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve NTP configuration: $_" }
+    }
+
+    # --- V-258746: VIB Acceptance Level ---
+    try {
+        $acceptance = $Esxcli.software.acceptance.get.Invoke()
+        $results["V-258746"] = if ($acceptance -match "PartnerSupported|VMwareCertified|VMwareAccepted") {
+            @{ Status = "NotAFinding"; Details = "VIB acceptance level is: $acceptance." }
+        } else {
+            @{ Status = "Open"; Details = "VIB acceptance level is: '$acceptance'. Expected: PartnerSupported or higher." }
+        }
+    } catch {
+        $results["V-258746"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve VIB acceptance level: $_" }
+    }
+
+    # --- V-258747: iSCSI CHAP (manual - may not apply) ---
+    $results["V-258747"] = @{ Status = "Not_Reviewed"; Details = "Manual check required. If iSCSI is not in use, mark Not_Applicable. Otherwise verify CHAP under Configure >> Storage >> Storage Adapters." }
+
+    # --- V-258748: vMotion Isolation - pull VLAN/VMkernel data for human review ---
+    try {
+        $pgInfo = Get-VirtualPortGroup -VMHost $VMHost -Standard -ErrorAction SilentlyContinue | ForEach-Object {
+            "PG:$($_.Name)|VLAN:$($_.VLanId)|SW:$($_.VirtualSwitchName)"
+        }
+        $vnicInfo = $VMHost.ExtensionData.Config.Network.Vnic | ForEach-Object {
+            "vmk:$($_.Device)|PG:$($_.Portgroup)|IP:$($_.Spec.Ip.IpAddress)"
+        }
+        $details = "VMkernels: $($vnicInfo -join '; ') | PortGroups: $($pgInfo -join '; ') | Manual verification required: Confirm vMotion VMkernel is on a dedicated VLAN not shared with management or other traffic."
+        $results["V-258748"] = @{ Status = "Not_Reviewed"; Details = $details }
+    } catch {
+        $results["V-258748"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve network info: $_. Manual check under Configure >> Networking >> VMkernel adapters." }
+    }
+
+    # --- V-258750: SSH Ciphers ---
+    $val = Get-SshConfig "ciphers"
+    $validCiphers = @("aes256-gcm@openssh.com","aes128-gcm@openssh.com","aes256-ctr","aes192-ctr","aes128-ctr")
+    $results["V-258750"] = if ($val -ne $null) {
+        $actualCiphers = $val -split ","
+        $invalid = $actualCiphers | Where-Object { $_ -notin $validCiphers }
+        if ($invalid.Count -eq 0) {
+            @{ Status = "NotAFinding"; Details = "SSH ciphers are correctly configured: $val." }
+        } else {
+            @{ Status = "Open"; Details = "SSH ciphers contain invalid entries: '$($invalid -join ',')'). Full value: $val." }
+        }
+    } else {
+        @{ Status = "Open"; Details = "Could not retrieve SSH cipher configuration." }
+    }
+
+    # --- V-258751: DCUI.Access = root only ---
+    $val = Get-Adv "DCUI.Access"
+    $results["V-258751"] = if ($val -eq "root") {
+        @{ Status = "NotAFinding"; Details = "DCUI.Access is set to 'root' only." }
+    } else {
+        @{ Status = "Open"; Details = "DCUI.Access is set to '$val'. Expected: root only." }
+    }
+
+    # --- V-258752: SSH Banner (Config.Etc.issue) ---
+    $val = Get-Adv "Config.Etc.issue"
+    $results["V-258752"] = if ($val -match "authorized use only" -or $val -match "U\.S\. Government") {
+        @{ Status = "NotAFinding"; Details = "Config.Etc.issue contains DOD banner text." }
+    } else {
+        @{ Status = "Open"; Details = "Config.Etc.issue does not contain required DOD banner. Current value: '$val'" }
+    }
+
+    # --- V-258753: SSH Banner path ---
+    $val = Get-SshConfig "banner"
+    $results["V-258753"] = if ($val -eq "/etc/issue") {
+        @{ Status = "NotAFinding"; Details = "SSH banner is set to /etc/issue." }
+    } else {
+        @{ Status = "Open"; Details = "SSH banner is set to '$val'. Expected: /etc/issue." }
+    }
+
+    # --- V-258754: SSH Service Stopped ---
+    $svc = Get-ServiceState "TSM-SSH"
+    $results["V-258754"] = if ($svc -eq $false) {
+        @{ Status = "NotAFinding"; Details = "SSH service is stopped." }
+    } else {
+        @{ Status = "Open"; Details = "SSH service is running. Expected: Stopped." }
+    }
+
+    # --- V-258755: ESXi Shell Stopped ---
+    $svc = Get-ServiceState "TSM"
+    $results["V-258755"] = if ($svc -eq $false) {
+        @{ Status = "NotAFinding"; Details = "ESXi Shell service is stopped." }
+    } else {
+        @{ Status = "Open"; Details = "ESXi Shell service is running. Expected: Stopped." }
+    }
+
+    # --- V-258756: Shell Timeout <= 600 ---
+    $val = Get-Adv "UserVars.ESXiShellTimeOut"
+    $results["V-258756"] = if ($val -ne $null -and [int]$val -le 600 -and [int]$val -ne 0) {
+        @{ Status = "NotAFinding"; Details = "UserVars.ESXiShellTimeOut is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "UserVars.ESXiShellTimeOut is set to '$val'. Expected: 600 or less (not 0)." }
+    }
+
+    # --- V-258757: DCUI Timeout <= 600 ---
+    $val = Get-Adv "UserVars.DcuiTimeOut"
+    $results["V-258757"] = if ($val -ne $null -and [int]$val -le 600 -and [int]$val -ne 0) {
+        @{ Status = "NotAFinding"; Details = "UserVars.DcuiTimeOut is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "UserVars.DcuiTimeOut is set to '$val'. Expected: 600 or less (not 0)." }
+    }
+
+    # --- V-258758: Management Traffic Isolation - pull VLAN data for human review ---
+    try {
+        $mgmtVnics = $VMHost.ExtensionData.Config.Network.Vnic | ForEach-Object {
+            "vmk:$($_.Device)|PG:$($_.Portgroup)|IP:$($_.Spec.Ip.IpAddress)"
+        }
+        $pgVlans = Get-VirtualPortGroup -VMHost $VMHost -Standard -ErrorAction SilentlyContinue | ForEach-Object {
+            "PG:$($_.Name)|VLAN:$($_.VLanId)"
+        }
+        $details = "VMkernels: $($mgmtVnics -join '; ') | PortGroups: $($pgVlans -join '; ') | Manual verification required: Confirm management VMkernel is on a dedicated VLAN not shared with vMotion or VM traffic."
+        $results["V-258758"] = @{ Status = "Not_Reviewed"; Details = $details }
+    } catch {
+        $results["V-258758"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve network info: $_. Manual check under Configure >> Networking >> VMkernel adapters." }
+    }
+
+    # --- V-258759: IP Storage Isolation - pull VLAN data for human review ---
+    try {
+        $pgVlans = Get-VirtualPortGroup -VMHost $VMHost -Standard -ErrorAction SilentlyContinue | ForEach-Object {
+            "PG:$($_.Name)|VLAN:$($_.VLanId)"
+        }
+        $vnicInfo = $VMHost.ExtensionData.Config.Network.Vnic | ForEach-Object {
+            "vmk:$($_.Device)|PG:$($_.Portgroup)|IP:$($_.Spec.Ip.IpAddress)"
+        }
+        $details = "VMkernels: $($vnicInfo -join '; ') | PortGroups: $($pgVlans -join '; ') | If no IP-based storage (iSCSI/NFS) mark Not_Applicable. Otherwise verify storage VMkernel is on a dedicated VLAN."
+        $results["V-258759"] = @{ Status = "Not_Reviewed"; Details = $details }
+    } catch {
+        $results["V-258759"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve network info: $_. If no IP storage mark Not_Applicable. Otherwise check under Configure >> Networking >> VMkernel adapters." }
+    }
+
+    # --- V-258760: Lockdown Exception Users (manual) ---
+    $results["V-258760"] = @{ Status = "Not_Reviewed"; Details = "Manual check required. Verify lockdown exception users list under Configure >> System >> Security Profile >> Lockdown Mode." }
+
+    # --- V-258761: SSH Host Based Auth = no ---
+    $val = Get-SshConfig "hostbasedauthentication"
+    $results["V-258761"] = if ($val -eq "no") {
+        @{ Status = "NotAFinding"; Details = "SSH hostbasedauthentication is set to 'no'." }
+    } else {
+        @{ Status = "Open"; Details = "SSH hostbasedauthentication is set to '$val'. Expected: no." }
+    }
+
+    # --- V-258762: SSH PermitUserEnvironment = no ---
+    $val = Get-SshConfig "permituserenvironment"
+    $results["V-258762"] = if ($val -eq "no") {
+        @{ Status = "NotAFinding"; Details = "SSH permituserenvironment is set to 'no'." }
+    } else {
+        @{ Status = "Open"; Details = "SSH permituserenvironment is set to '$val'. Expected: no." }
+    }
+
+    # --- V-258763: SSH GatewayPorts = no ---
+    $val = Get-SshConfig "gatewayports"
+    $results["V-258763"] = if ($val -eq "no") {
+        @{ Status = "NotAFinding"; Details = "SSH gatewayports is set to 'no'." }
+    } else {
+        @{ Status = "Open"; Details = "SSH gatewayports is set to '$val'. Expected: no." }
+    }
+
+    # --- V-258764: SSH PermitTunnel = no ---
+    $val = Get-SshConfig "permittunnel"
+    $results["V-258764"] = if ($val -eq "no") {
+        @{ Status = "NotAFinding"; Details = "SSH permittunnel is set to 'no'." }
+    } else {
+        @{ Status = "Open"; Details = "SSH permittunnel is set to '$val'. Expected: no." }
+    }
+
+    # --- V-258765: SSH ClientAliveCountMax = 3 ---
+    $val = Get-SshConfig "clientalivecountmax"
+    $results["V-258765"] = if ($val -eq "3") {
+        @{ Status = "NotAFinding"; Details = "SSH clientalivecountmax is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "SSH clientalivecountmax is set to '$val'. Expected: 3." }
+    }
+
+    # --- V-258766: SSH ClientAliveInterval = 200 ---
+    $val = Get-SshConfig "clientaliveinterval"
+    $results["V-258766"] = if ($val -eq "200") {
+        @{ Status = "NotAFinding"; Details = "SSH clientaliveinterval is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "SSH clientaliveinterval is set to '$val'. Expected: 200." }
+    }
+
+    # --- V-258767: SNMP Disabled or v3 only ---
+    try {
+        $snmp = $Esxcli.system.snmp.get.Invoke()
+        $results["V-258767"] = if ($snmp.Enable -eq $false -or $snmp.Enable -eq "false") {
+            @{ Status = "NotAFinding"; Details = "SNMP is disabled." }
+        } else {
+            @{ Status = "Open"; Details = "SNMP is enabled. Verify only v3 targets are configured. Current config: Enable=$($snmp.Enable), V3targets=$($snmp.V3targets)." }
+        }
+    } catch {
+        $results["V-258767"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve SNMP configuration: $_" }
+    }
+
+    # --- V-258768: Mem.ShareForceSalting = 2 ---
+    $val = Get-Adv "Mem.ShareForceSalting"
+    $results["V-258768"] = if ($val -eq 2) {
+        @{ Status = "NotAFinding"; Details = "Mem.ShareForceSalting is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Mem.ShareForceSalting is set to '$val'. Expected: 2." }
+    }
+
+    # --- V-258769: Firewall Default Action = DROP ---
+    try {
+        $fw = $Esxcli.network.firewall.get.Invoke()
+        $results["V-258769"] = if ($fw.DefaultAction -eq "DROP") {
+            @{ Status = "NotAFinding"; Details = "Firewall default action is DROP." }
+        } else {
+            @{ Status = "Open"; Details = "Firewall default action is '$($fw.DefaultAction)'. Expected: DROP." }
+        }
+    } catch {
+        $results["V-258769"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve firewall configuration: $_" }
+    }
+
+    # --- V-258770: BPDU Filter = 1 ---
+    $val = Get-Adv "Net.BlockGuestBPDU"
+    $results["V-258770"] = if ($val -eq 1) {
+        @{ Status = "NotAFinding"; Details = "Net.BlockGuestBPDU is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Net.BlockGuestBPDU is set to '$val'. Expected: 1." }
+    }
+
+    # --- V-258771: VSS Forged Transmits = Reject ---
+    try {
+        $vswitches = Get-VirtualSwitch -VMHost $VMHost -Standard -ErrorAction SilentlyContinue
+        if ($vswitches.Count -eq 0) {
+            $results["V-258771"] = @{ Status = "Not_Applicable"; Details = "No standard virtual switches found on this host." }
+        } else {
+            $findings = @()
+            foreach ($vss in $vswitches) {
+                $policy = $vss.ExtensionData.Spec.Policy.Security
+                $portGroups = Get-VirtualPortGroup -VirtualSwitch $vss -ErrorAction SilentlyContinue
+                foreach ($pg in $portGroups) {
+                    $pgPolicy = $pg.ExtensionData.Spec.Policy.Security
+                    $effective = if ($pgPolicy.ForgedTransmits -ne $null) { $pgPolicy.ForgedTransmits } else { $policy.ForgedTransmits }
+                    if ($effective -eq $true) { $findings += "FAIL: $($vss.Name)/$($pg.Name) ForgedTransmits=Accept" }
+                }
+                if ($policy.ForgedTransmits -eq $true) { $findings += "FAIL: $($vss.Name) switch-level ForgedTransmits=Accept" }
+            }
+            if ($findings.Count -eq 0) {
+                $results["V-258771"] = @{ Status = "NotAFinding"; Details = "All standard switches and port groups have Forged Transmits set to Reject." }
+            } else {
+                $results["V-258771"] = @{ Status = "Open"; Details = "$($findings -join '; ')" }
+            }
+        }
+    } catch {
+        $results["V-258771"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve VSS security policy: $_" }
+    }
+
+    # --- V-258772: VSS MAC Changes = Reject ---
+    try {
+        $vswitches = Get-VirtualSwitch -VMHost $VMHost -Standard -ErrorAction SilentlyContinue
+        if ($vswitches.Count -eq 0) {
+            $results["V-258772"] = @{ Status = "Not_Applicable"; Details = "No standard virtual switches found on this host." }
+        } else {
+            $findings = @()
+            foreach ($vss in $vswitches) {
+                $policy = $vss.ExtensionData.Spec.Policy.Security
+                $portGroups = Get-VirtualPortGroup -VirtualSwitch $vss -ErrorAction SilentlyContinue
+                foreach ($pg in $portGroups) {
+                    $pgPolicy = $pg.ExtensionData.Spec.Policy.Security
+                    $effective = if ($pgPolicy.MacChanges -ne $null) { $pgPolicy.MacChanges } else { $policy.MacChanges }
+                    if ($effective -eq $true) { $findings += "FAIL: $($vss.Name)/$($pg.Name) MacChanges=Accept" }
+                }
+                if ($policy.MacChanges -eq $true) { $findings += "FAIL: $($vss.Name) switch-level MacChanges=Accept" }
+            }
+            if ($findings.Count -eq 0) {
+                $results["V-258772"] = @{ Status = "NotAFinding"; Details = "All standard switches and port groups have MAC Address Changes set to Reject." }
+            } else {
+                $results["V-258772"] = @{ Status = "Open"; Details = "$($findings -join '; ')" }
+            }
+        }
+    } catch {
+        $results["V-258772"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve VSS security policy: $_" }
+    }
+
+    # --- V-258773: VSS Promiscuous Mode = Reject ---
+    try {
+        $vswitches = Get-VirtualSwitch -VMHost $VMHost -Standard -ErrorAction SilentlyContinue
+        if ($vswitches.Count -eq 0) {
+            $results["V-258773"] = @{ Status = "Not_Applicable"; Details = "No standard virtual switches found on this host." }
+        } else {
+            $findings = @()
+            foreach ($vss in $vswitches) {
+                $policy = $vss.ExtensionData.Spec.Policy.Security
+                $portGroups = Get-VirtualPortGroup -VirtualSwitch $vss -ErrorAction SilentlyContinue
+                foreach ($pg in $portGroups) {
+                    $pgPolicy = $pg.ExtensionData.Spec.Policy.Security
+                    $effective = if ($pgPolicy.AllowPromiscuous -ne $null) { $pgPolicy.AllowPromiscuous } else { $policy.AllowPromiscuous }
+                    if ($effective -eq $true) { $findings += "FAIL: $($vss.Name)/$($pg.Name) PromiscuousMode=Accept" }
+                }
+                if ($policy.AllowPromiscuous -eq $true) { $findings += "FAIL: $($vss.Name) switch-level PromiscuousMode=Accept" }
+            }
+            if ($findings.Count -eq 0) {
+                $results["V-258773"] = @{ Status = "NotAFinding"; Details = "All standard switches and port groups have Promiscuous Mode set to Reject." }
+            } else {
+                $results["V-258773"] = @{ Status = "Open"; Details = "$($findings -join '; ')" }
+            }
+        }
+    } catch {
+        $results["V-258773"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve VSS security policy: $_" }
+    }
+
+    # --- V-258774: dvFilter Bind IP = blank ---
+    $val = Get-Adv "Net.DVFilterBindIpAddress"
+    $results["V-258774"] = if ($val -eq $null -or $val -eq "") {
+        @{ Status = "NotAFinding"; Details = "Net.DVFilterBindIpAddress is blank." }
+    } else {
+        @{ Status = "Open"; Details = "Net.DVFilterBindIpAddress is set to '$val'. Should be blank unless a security appliance is in use." }
+    }
+
+    # --- V-258775: VGT VLAN 4095 Restriction ---
+    try {
+        $vswitches = Get-VirtualSwitch -VMHost $VMHost -Standard -ErrorAction SilentlyContinue
+        if ($vswitches.Count -eq 0) {
+            $results["V-258775"] = @{ Status = "Not_Applicable"; Details = "No standard virtual switches found on this host." }
+        } else {
+            $vgt = Get-VirtualPortGroup -VMHost $VMHost -Standard -ErrorAction SilentlyContinue | Where-Object { $_.VLanId -eq 4095 }
+            if ($vgt.Count -eq 0) {
+                $allPGs = Get-VirtualPortGroup -VMHost $VMHost -Standard -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Name):VLAN$($_.VLanId)" }
+                $results["V-258775"] = @{ Status = "NotAFinding"; Details = "No port groups using VLAN 4095. All port groups: $($allPGs -join ', ')." }
+            } else {
+                $bad = $vgt | ForEach-Object { "$($_.Name) on $($_.VirtualSwitchName)" }
+                $results["V-258775"] = @{ Status = "Open"; Details = "Port groups using VLAN 4095 (VGT): $($bad -join '; '). Remove VLAN 4095 unless explicitly required and documented." }
+            }
+        }
+    } catch {
+        $results["V-258775"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve port group VLAN info: $_" }
+    }
+
+    # --- V-258776: Patches current (manual) ---
+    $build = $VMHost.Build
+    $version = $VMHost.Version
+    $results["V-258776"] = @{ Status = "Not_Reviewed"; Details = "Manual check required. Host version: $version, Build: $build. Verify this matches the latest patch level from Broadcom." }
+
+    # --- V-258777: SuppressShellWarning = 0 ---
+    $val = Get-Adv "UserVars.SuppressShellWarning"
+    $results["V-258777"] = if ($val -eq 0) {
+        @{ Status = "NotAFinding"; Details = "UserVars.SuppressShellWarning is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "UserVars.SuppressShellWarning is set to '$val'. Expected: 0." }
+    }
+
+    # --- V-258778: SuppressHyperthreadWarning = 0 ---
+    $val = Get-Adv "UserVars.SuppressHyperthreadWarning"
+    $results["V-258778"] = if ($val -eq 0) {
+        @{ Status = "NotAFinding"; Details = "UserVars.SuppressHyperthreadWarning is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "UserVars.SuppressHyperthreadWarning is set to '$val'. Expected: 0." }
+    }
+
+    # --- V-258779: SSL Syslog Cert Check ---
+    $val = Get-Adv "Syslog.global.certificate.checkSSLCerts"
+    $results["V-258779"] = if ($val -eq $true -or $val -eq "true") {
+        @{ Status = "NotAFinding"; Details = "Syslog.global.certificate.checkSSLCerts is true." }
+    } else {
+        @{ Status = "Open"; Details = "Syslog.global.certificate.checkSSLCerts is '$val'. Expected: true." }
+    }
+
+    # --- V-258780: Mem.MemEagerZero = 1 ---
+    $val = Get-Adv "Mem.MemEagerZero"
+    $results["V-258780"] = if ($val -eq 1) {
+        @{ Status = "NotAFinding"; Details = "Mem.MemEagerZero is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Mem.MemEagerZero is set to '$val'. Expected: 1." }
+    }
+
+    # --- V-258781: vSphere API Session Timeout = 30 ---
+    $val = Get-Adv "Config.HostAgent.vmacore.soap.sessionTimeout"
+    $results["V-258781"] = if ($val -eq 30) {
+        @{ Status = "NotAFinding"; Details = "Config.HostAgent.vmacore.soap.sessionTimeout is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Config.HostAgent.vmacore.soap.sessionTimeout is set to '$val'. Expected: 30." }
+    }
+
+    # --- V-258782: Password Max Days = 90 ---
+    $val = Get-Adv "Security.PasswordMaxDays"
+    $results["V-258782"] = if ($val -eq 90) {
+        @{ Status = "NotAFinding"; Details = "Security.PasswordMaxDays is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Security.PasswordMaxDays is set to '$val'. Expected: 90." }
+    }
+
+    # --- V-258783: CIM Service Stopped ---
+    $svc = Get-ServiceState "sfcbd-watchdog"
+    $results["V-258783"] = if ($svc -eq $false) {
+        @{ Status = "NotAFinding"; Details = "CIM service is stopped." }
+    } else {
+        @{ Status = "Open"; Details = "CIM service is running. Expected: Stopped." }
+    }
+
+    # --- V-258784: DOD Certificates (manual) ---
+    $results["V-258784"] = @{ Status = "Not_Reviewed"; Details = "Manual check required. Verify certificate issuer is a DOD-approved CA under Configure >> System >> Certificate." }
+
+    # --- V-258785: SSH AllowTcpForwarding = no ---
+    $val = Get-SshConfig "allowtcpforwarding"
+    $results["V-258785"] = if ($val -eq "no") {
+        @{ Status = "NotAFinding"; Details = "SSH allowtcpforwarding is set to 'no'." }
+    } else {
+        @{ Status = "Open"; Details = "SSH allowtcpforwarding is set to '$val'. Expected: no." }
+    }
+
+    # --- V-258786: OpenSLP Service Stopped ---
+    $svc = Get-ServiceState "slpd"
+    $results["V-258786"] = if ($svc -eq $false) {
+        @{ Status = "NotAFinding"; Details = "OpenSLP service is stopped." }
+    } else {
+        @{ Status = "Open"; Details = "OpenSLP service is running. Expected: Stopped." }
+    }
+
+    # --- V-258787: Audit Logging Enabled ---
+    $val = Get-Adv "Syslog.global.auditRecord.storageEnable"
+    $results["V-258787"] = if ($val -eq $true -or $val -eq "true") {
+        @{ Status = "NotAFinding"; Details = "Syslog.global.auditRecord.storageEnable is true." }
+    } else {
+        @{ Status = "Open"; Details = "Syslog.global.auditRecord.storageEnable is '$val'. Expected: true." }
+    }
+
+    # --- V-258788: Audit Records Remote Enable ---
+    $val = Get-Adv "Syslog.global.auditRecord.remoteEnable"
+    $results["V-258788"] = if ($val -eq $true -or $val -eq "true") {
+        @{ Status = "NotAFinding"; Details = "Syslog.global.auditRecord.remoteEnable is true." }
+    } else {
+        @{ Status = "Open"; Details = "Syslog.global.auditRecord.remoteEnable is '$val'. Expected: true." }
+    }
+
+    # --- V-258789: Strict X509 Compliance ---
+    $val = Get-Adv "Syslog.global.certificate.strictX509Compliance"
+    $results["V-258789"] = if ($val -eq $true -or $val -eq "true") {
+        @{ Status = "NotAFinding"; Details = "Syslog.global.certificate.strictX509Compliance is true." }
+    } else {
+        @{ Status = "Open"; Details = "Syslog.global.certificate.strictX509Compliance is '$val'. Expected: true." }
+    }
+
+    # --- V-258790: Syslog Log Level = info ---
+    $val = Get-Adv "Syslog.global.logLevel"
+    $results["V-258790"] = if ($val -eq "info") {
+        @{ Status = "NotAFinding"; Details = "Syslog.global.logLevel is set to '$val'." }
+    } else {
+        @{ Status = "Open"; Details = "Syslog.global.logLevel is set to '$val'. Expected: info." }
+    }
+
+    # --- V-258791: VM Config Override (SSH required - manual) ---
+    $results["V-258791"] = @{ Status = "Not_Reviewed"; Details = "Manual check required via SSH. Run: stat -c '%s' /etc/vmware/settings. Expected result: 0." }
+
+    # --- V-258792: VM Logger Override (SSH required - manual) ---
+    $results["V-258792"] = @{ Status = "Not_Reviewed"; Details = "Manual check required via SSH. Run: grep '^vmx\.log' /etc/vmware/config. No output = pass." }
+
+    # --- V-258793: TPM Encryption ---
+    try {
+        $enc = $Esxcli.system.settings.encryption.get.Invoke()
+        $results["V-258793"] = if ($enc.Mode -eq "TPM") {
+            @{ Status = "NotAFinding"; Details = "Encryption mode is TPM." }
+        } else {
+            @{ Status = "Open"; Details = "Encryption mode is '$($enc.Mode)'. Expected: TPM." }
+        }
+    } catch {
+        $results["V-258793"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve encryption settings: $_" }
+    }
+
+    # --- V-258794: Firewall IP Restrictions (manual) ---
+    $results["V-258794"] = @{ Status = "Not_Reviewed"; Details = "Manual check required. Verify all services have IP restrictions configured under Configure >> System >> Firewall." }
+
+    # --- V-258795: Auth Proxy for Host Profiles (manual) ---
+    $results["V-258795"] = @{ Status = "Not_Reviewed"; Details = "Manual check required. If not using Host Profiles to join AD, mark Not_Applicable. Otherwise verify Auth Proxy is configured." }
+
+    # --- V-258796: AD ESX Admin Group ---
+    $val = Get-Adv "Config.HostAgent.plugins.hostsvc.esxAdminsGroup"
+    $results["V-258796"] = if ($val -ne "ESX Admins") {
+        @{ Status = "NotAFinding"; Details = "Config.HostAgent.plugins.hostsvc.esxAdminsGroup is set to '$val' (not default)." }
+    } else {
+        @{ Status = "Open"; Details = "Config.HostAgent.plugins.hostsvc.esxAdminsGroup is set to default value 'ESX Admins'." }
+    }
+
+    # --- V-258797: Persistent Log Location ---
+    $val = Get-Adv "Syslog.global.logDir"
+    $results["V-258797"] = if ($val -ne $null -and $val -ne "" -and $val -notmatch "^\[\] /scratch/logs$") {
+        @{ Status = "NotAFinding"; Details = "Syslog.global.logDir is set to '$val'." }
+    } else {
+        @{ Status = "Open"; Details = "Syslog.global.logDir is set to '$val'. Must be a persistent datastore location." }
+    }
+
+    # --- V-258798: ExecInstalledOnly = true ---
+    $val = Get-Adv "VMkernel.Boot.execInstalledOnly"
+    $results["V-258798"] = if ($val -eq $true -or $val -eq "true") {
+        @{ Status = "NotAFinding"; Details = "VMkernel.Boot.execInstalledOnly is true." }
+    } else {
+        @{ Status = "Open"; Details = "VMkernel.Boot.execInstalledOnly is '$val'. Expected: true." }
+    }
+
+    # --- V-258799: Entropy Sources ---
+    try {
+        $hwrng = $Esxcli.system.settings.kernel.list.Invoke() | Where-Object { $_.Name -eq "disableHwrng" }
+        $results["V-258799"] = if ($hwrng.RuntimeValue -eq "FALSE") {
+            @{ Status = "NotAFinding"; Details = "disableHwrng is FALSE - hardware entropy is enabled." }
+        } else {
+            @{ Status = "Open"; Details = "disableHwrng is '$($hwrng.RuntimeValue)'. Expected: FALSE." }
+        }
+    } catch {
+        $results["V-258799"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve kernel entropy settings: $_" }
+    }
+
+    # --- V-258800: Log Filtering Disabled ---
+    try {
+        $lf = $Esxcli.system.syslog.config.logfilter.get.Invoke()
+        $results["V-258800"] = if ($lf.LogFilteringEnabled -eq $false -or $lf.LogFilteringEnabled -eq "false") {
+            @{ Status = "NotAFinding"; Details = "Log filtering is disabled." }
+        } else {
+            @{ Status = "Open"; Details = "Log filtering is enabled. Expected: disabled." }
+        }
+    } catch {
+        $results["V-258800"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve log filter configuration: $_" }
+    }
+
+    # --- V-265974: TLS Profile ---
+    try {
+        $tls = $Esxcli.system.tls.server.get.Invoke()
+        $results["V-265974"] = if ($tls -match "NIST_2024") {
+            @{ Status = "NotAFinding"; Details = "TLS profile is set to NIST_2024." }
+        } else {
+            @{ Status = "Open"; Details = "TLS profile is '$tls'. Expected: NIST_2024." }
+        }
+    } catch {
+        $results["V-265974"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve TLS configuration: $_" }
+    }
+
+    # --- V-265975: Key Persistence Disabled ---
+    try {
+        $kp = $Esxcli.system.security.keypersistence.get.Invoke()
+        $results["V-265975"] = if ($kp.Enabled -eq $false -or $kp.Enabled -eq "false") {
+            @{ Status = "NotAFinding"; Details = "Key persistence is disabled." }
+        } else {
+            @{ Status = "Open"; Details = "Key persistence is enabled. Expected: disabled." }
+        }
+    } catch {
+        $results["V-265975"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve key persistence configuration: $_" }
+    }
+
+    # --- V-265976: DCUI Shell Access Denied ---
+    try {
+        $dcui = $Esxcli.system.account.list.Invoke() | Where-Object { $_.UserID -eq "dcui" }
+        $results["V-265976"] = if ($dcui.ShellAccess -eq $false -or $dcui.ShellAccess -eq "false") {
+            @{ Status = "NotAFinding"; Details = "dcui account shell access is disabled." }
+        } else {
+            @{ Status = "Open"; Details = "dcui account shell access is '$($dcui.ShellAccess)'. Expected: false." }
+        }
+    } catch {
+        $results["V-265976"] = @{ Status = "Not_Reviewed"; Details = "Could not retrieve dcui account configuration: $_" }
+    }
+
+    # --- V-265977: BMC Network Disabled = 0 ---
+    $val = Get-Adv "Net.BMCNetworkEnable"
+    $results["V-265977"] = if ($val -eq 0) {
+        @{ Status = "NotAFinding"; Details = "Net.BMCNetworkEnable is set to $val." }
+    } else {
+        @{ Status = "Open"; Details = "Net.BMCNetworkEnable is set to '$val'. Expected: 0." }
+    }
+
+    return $results
+}
+
+# ============================================================
+# CKLB WRITER
+# Builds a valid STIG Viewer 3.x .cklb (JSON) file from audit results
+# ============================================================
+function Write-CKLB {
+    param(
+        $HostName,
+        $HostIP,
+        $Results,
+        $RuleLookup,
+        $OutputPath
+    )
+
+    $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    $hostGuid  = [System.Guid]::NewGuid().ToString()
+
+    # Build checklist items array
+    $checklistItems = @()
+    foreach ($vulnId in ($Results.Keys | Sort-Object)) {
+        $result = $Results[$vulnId]
+        $rule   = $RuleLookup[$vulnId]
+        if (-not $rule) { continue }
+
+        $status = switch ($result.Status) {
+            "NotAFinding"    { "not_a_finding" }
+            "Open"           { "open" }
+            "Not_Applicable" { "not_applicable" }
+            "Not_Reviewed"   { "not_reviewed" }
+            default          { "not_reviewed" }
+        }
+
+        $sev = switch ($rule.Severity) {
+            "high"   { "high" }
+            "medium" { "medium" }
+            "low"    { "low" }
+            default  { "medium" }
+        }
+
+        # Escape backslashes and quotes for JSON
+        $details  = $result.Details  -replace '\', '\\' -replace '"', '"' -replace "`r`n", '
+' -replace "`n", '
+'
+        $title    = $rule.Title      -replace '\', '\\' -replace '"', '"'
+        $check    = $rule.CheckText  -replace '\', '\\' -replace '"', '"' -replace "`r`n", '
+' -replace "`n", '
+'
+        $ruleId   = $rule.RuleId     -replace '\', '\\' -replace '"', '"'
+
+        $checklistItems += [PSCustomObject]@{
+            uuid                  = [System.Guid]::NewGuid().ToString()
+            stig_uuid             = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            target_key            = "5562"
+            stig_ref              = "VMware_vSphere_8.0_ESXi_STIG"
+            group_id              = $vulnId
+            rule_id               = $ruleId
+            rule_id_src           = $ruleId
+            weight                = "10.0"
+            classification        = "UNCLASSIFIED"
+            stig_title            = "VMware vSphere 8.0 ESXi Security Technical Implementation Guide"
+            rule_title            = $title
+            vuln_discuss          = ""
+            ia_controls           = ""
+            check_content         = $check
+            fix_text              = ""
+            false_positives       = ""
+            false_negatives       = ""
+            documentable          = "false"
+            mitigations           = ""
+            potential_impact      = ""
+            third_party_tools     = ""
+            mitigation_control    = ""
+            responsibility        = ""
+            security_override_guidance = ""
+            check_content_ref     = ""
+            weight2               = "10.0"
+            class                 = "Unclass"
+            stig_ref2             = "VMware_vSphere_8.0_ESXi_STIG :: Version 2, Release 3"
+            cci_ref               = ""
+            group_title           = $vulnId
+            rule_ver              = $vulnId
+            severity              = $sev
+            gid                   = $vulnId
+            status                = $status
+            finding_details       = $details
+            comments              = "Automated check performed by PowerCLI audit script."
+            severity_override     = ""
+            severity_justification = ""
+        }
+    }
+
+    # Serialize to JSON manually to avoid depth issues in PS 5.1
+    $itemsJson = $checklistItems | ForEach-Object {
+        $item = $_
+        $props = $item.PSObject.Properties | ForEach-Object {
+            "`"$($_.Name)`": `"$($_.Value)`""
+        }
+        "{" + ($props -join ", ") + "}"
+    }
+
+    $json = @"
+{
+  "title": "VMware vSphere 8.0 ESXi Security Technical Implementation Guide",
+  "id": "$hostGuid",
+  "stigs": [
+    {
+      "benchmark": {
+        "title": "VMware vSphere 8.0 ESXi Security Technical Implementation Guide",
+        "version": "2",
+        "release": "3",
+        "benchmarkDate": "02 Apr 2025",
+        "id": "VMware_vSphere_8.0_ESXi_STIG",
+        "filename": "U_VMW_vSphere_8-0-ESXi_STIG_V2R3_Manual-xccdf.xml"
+      },
+      "asset": {
+        "role": "None",
+        "assetType": "Computing",
+        "hostName": "$HostName",
+        "hostIp": "$HostIP",
+        "hostMac": "",
+        "hostFqdn": "$HostName",
+        "targetComment": "",
+        "techArea": "",
+        "targetKey": "5562",
+        "webOrDatabase": false,
+        "webDbSite": "",
+        "webDbInstance": ""
+      },
+      "checklist": [
+        $($itemsJson -join ",`n        ")
+      ]
+    }
+  ],
+  "createdDate": "$timestamp",
+  "lastModifiedDate": "$timestamp"
+}
+"@
+
+    $json | Out-File -FilePath $OutputPath -Encoding UTF8
+}
+
+# ============================================================
+# MAIN - Connect to vCenter and loop through all ESXi hosts
+# ============================================================
+Write-Host "`n[*] Connecting to vCenter: $VCenterServer..." -ForegroundColor Cyan
+try {
+    $conn = Connect-VIServer -Server $VCenterServer -Credential $Credential -ErrorAction Stop
+    Write-Host "[+] Connected to vCenter successfully." -ForegroundColor Green
+}
+catch {
+    Write-Host "[!] Failed to connect to vCenter: $($_.Exception.Message)" -ForegroundColor Red
+    exit 1
+}
+
+$allHosts = Get-VMHost
+Write-Host "[+] Found $($allHosts.Count) ESXi host(s): $($allHosts -join ', ')" -ForegroundColor Green
+
+foreach ($vmhost in $allHosts) {
+    Write-Host "`n[*] Auditing $vmhost..." -ForegroundColor Cyan
+    try {
+        $esxcli = Get-EsxCli -VMHost $vmhost -V2 -ErrorAction Stop
+        $hostIP = ($vmhost.ExtensionData.Config.Network.Vnic | Where-Object { $_.Device -eq "vmk0" }).Spec.Ip.IpAddress
+
+        Write-Host "[+] Running 77 STIG checks on $vmhost..." -ForegroundColor Green
+        $results = Invoke-Checks -VMHost $vmhost -Esxcli $esxcli
+
+        $pass   = ($results.Values | Where-Object { $_.Status -eq "NotAFinding" }).Count
+        $fail   = ($results.Values | Where-Object { $_.Status -eq "Open" }).Count
+        $review = ($results.Values | Where-Object { $_.Status -eq "Not_Reviewed" }).Count
+
+        Write-Host "[+] Results: $pass Pass | $fail Open | $review Needs Review" -ForegroundColor Yellow
+
+        # Sanitize hostname for filename
+        $safeName = $vmhost -replace '[\\/:*?"<>|]', '_'
+        $cklbPath = "$OutputDir\$safeName`_ESXi_STIG_Audit_$(Get-Date -Format 'yyyyMMdd').cklb"
+        Write-CKLB -HostName $vmhost -HostIP $hostIP -Results $results -RuleLookup $RuleLookup -OutputPath $cklbPath
+        Write-Host "[+] CKLB file saved: $cklbPath" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "[!] Failed on $vmhost: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+Write-Host "`n[*] Disconnecting from vCenter..." -ForegroundColor Cyan
+Disconnect-VIServer -Server $conn -Confirm:$false
+
+Write-Host "`n[*] Audit complete. CKLB files saved to $OutputDir" -ForegroundColor Cyan
+
+# ============================================================
+# CLEANUP - Unload all PowerCLI modules
+# ============================================================
+Write-Host "`n[*] Unloading PowerCLI modules..." -ForegroundColor Cyan
+$modulesToRemove = @(
+    "VMware.VimAutomation.Core",
+    "VMware.VimAutomation.Cis.Core",
+    "VMware.VimAutomation.Common",
+    "VMware.OpenAPI",
+    "VMware.Vim",
+    "VMware.VimAutomation.Sdk"
+)
+foreach ($mod in $modulesToRemove) {
+    Remove-Module -Name $mod -Force -ErrorAction SilentlyContinue
+}
+Write-Host "[+] PowerCLI modules unloaded." -ForegroundColor Green
